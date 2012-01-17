@@ -1,0 +1,232 @@
+*** a/src/backend/postmaster/pgstat.c
+--- b/src/backend/postmaster/pgstat.c
+***************
+*** 174,179 **** static TabStatusArray *pgStatTabList = NULL;
+--- 174,186 ----
+  static HTAB *pgStatFunctions = NULL;
+  
+  /*
++  * Call graph
++  */
++ static List *call_stack       = NIL;
++ static HTAB *call_graph       = NULL;
++ static HTAB *seen_call_graphs = NULL;
++ 
++ /*
+   * Indicates if backend has some function stats that it hasn't yet
+   * sent to the collector.
+   */
+***************
+*** 286,291 **** static void pgstat_recv_bgwriter(PgStat_MsgBgWriter *msg, int len);
+--- 293,299 ----
+  static void pgstat_recv_funcstat(PgStat_MsgFuncstat *msg, int len);
+  static void pgstat_recv_funcpurge(PgStat_MsgFuncpurge *msg, int len);
+  static void pgstat_recv_recoveryconflict(PgStat_MsgRecoveryConflict *msg, int len);
++ static int pgstat_edge_comparator(const void *arg1, const void *arg2);
+  
+  
+  /* ------------------------------------------------------------
+***************
+*** 1384,1389 **** pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
+--- 1392,1398 ----
+  						   PgStat_FunctionCallUsage *fcu)
+  {
+  	PgStat_BackendFunctionEntry *htabent;
++ 	PgStat_CallGraphEdge call_graph_edge;
+  	bool		found;
+  
+  	if (pgstat_track_functions <= fcinfo->flinfo->fn_stats)
+***************
+*** 1424,1429 **** pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
+--- 1433,1469 ----
+  
+  	/* get clock time as of function start */
+  	INSTR_TIME_SET_CURRENT(fcu->f_start);
++ 
++ 	if (!call_graph)
++ 	{
++ 		/* First time through - initialize call graph hash */
++ 		HASHCTL		hash_ctl;
++ 
++ 		memset(&hash_ctl, 0, sizeof(hash_ctl));
++ 		hash_ctl.keysize = sizeof(PgStat_CallGraphEdge);
++ 		hash_ctl.entrysize = sizeof(PgStat_CallGraphEdge);
++ 		hash_ctl.hash = tag_hash;
++ 		call_graph = hash_create("Call graph",
++ 								PGSTAT_FUNCTION_HASH_SIZE,
++ 								&hash_ctl,
++ 								HASH_ELEM | HASH_FUNCTION);
++ 	}
++ 
++ 	if (call_stack != NIL)
++ 	{
++ 		/* Non-empty call stack which means we are in a subroutine called from a parent */
++ 
++ 		/* Set the oid of the caller and called function */
++ 		
++ 		call_graph_edge.caller_oid = lfirst_oid(call_stack->head);
++ 		call_graph_edge.called_oid = fcinfo->flinfo->fn_oid;
++ 
++ 		/* Set the unique combination of caller/called oid, if not already set */
++ 		hash_search(call_graph, &call_graph_edge, HASH_ENTER, NULL);
++ 	}
++ 	/* Add called function oid to the head of the call stack list */
++ 	call_stack = lcons_oid(fcinfo->flinfo->fn_oid, call_stack);
++ 
+  }
+  
+  /*
+***************
+*** 1494,1499 **** pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
+--- 1534,1542 ----
+  
+  	/* indicate that we have something to send */
+  	have_function_stats = true;
++ 
++ 	/* Remove this function OID from call stack, if it's non-empty the new head will be the parent OID */
++ 	call_stack = list_delete_first(call_stack);
+  }
+  
+  
+***************
+*** 1772,1777 **** AtEOXact_PgStat(bool isCommit)
+--- 1815,1873 ----
+  {
+  	PgStat_SubXactStatus *xact_state;
+  
++ 	/* Log call graph */
++ 	PgStat_CallGraphEdge	*call_graph_edge;
++ 	HASH_SEQ_STATUS			call_graph_stat;
++ 	int						num_edges = 0;
++ 	bool					found;
++ 	char					call_graph_string[16384];
++ 	char					call_graph_edge_string[1024];
++ 	int						edge_pos;
++ 	if (call_graph) {
++ 		PgStat_CallGraphEdge **edges = (PgStat_CallGraphEdge **) palloc(hash_get_num_entries(call_graph) * sizeof(PgStat_CallGraphEdge *));;
++ 	
++ 		/* TODO: Build List of OIDs where every second OID is the called OID and every first OID is the caller OID
++ 		 * Example:
++ 		 * Input Hash: 16386->16389, 16389->16391, 16386->16388, 16389->16390
++ 		 * Output Sorted List: [16386,16388,16386,16389,16389,16390,16389,16391]
++ 		*/
++ 		hash_seq_init(&call_graph_stat, call_graph);
++ 		while ((call_graph_edge = (PgStat_CallGraphEdge *) hash_seq_search(&call_graph_stat)) != NULL)
++ 		{
++ 			edges[num_edges] = call_graph_edge;
++ 			num_edges++;
++ 		}
++ 		qsort(edges, num_edges, sizeof(PgStat_CallGraphEdge *), pgstat_edge_comparator);
++ 
++ 		if (!seen_call_graphs)
++ 		{
++ 			/* First time through - initialize seen call graphs hash */
++ 			HASHCTL		hash_ctl;
++ 	
++ 			memset(&hash_ctl, 0, sizeof(hash_ctl));
++ 			seen_call_graphs = hash_create("Seen call graphs",
++ 									PGSTAT_FUNCTION_HASH_SIZE,
++ 									&hash_ctl,
++ 									0);
++ 		}
++ 
++ 		if (num_edges > 0) {
++ 			call_graph_string[0] = '\0';
++ 			for (edge_pos = 0; edge_pos < num_edges; edge_pos++) {
++ 				sprintf(call_graph_edge_string,"%u->%u;",edges[edge_pos]->caller_oid, edges[edge_pos]->called_oid);
++ 				if (strlen(call_graph_edge_string) + strlen(call_graph_string) < 16300) {
++ 					strcat(call_graph_string, call_graph_edge_string);
++ 				}
++ 			}
++ 			call_graph_string[strlen(call_graph_string)-1] = '\0';
++ 			hash_search(seen_call_graphs, call_graph_string, HASH_ENTER, &found);
++ 			if (!found) {
++ 				ereport(LOG, (errmsg("digraph {%s}", call_graph_string)));
++ 			}
++ 		}
++ 	}
++ 	
++ 
+  	/*
+  	 * Count transaction commit or abort.  (We use counters, not just bools,
+  	 * in case the reporting message isn't sent right away.)
+***************
+*** 1830,1835 **** AtEOXact_PgStat(bool isCommit)
+--- 1926,1933 ----
+  	}
+  	pgStatXactStack = NULL;
+  
++ 
++ 
+  	/* Make sure any stats snapshot is thrown away */
+  	pgstat_clear_snapshot();
+  }
+***************
+*** 3946,3951 **** pgstat_clear_snapshot(void)
+--- 4044,4051 ----
+  	pgStatDBHash = NULL;
+  	localBackendStatusTable = NULL;
+  	localNumBackends = 0;
++ 	call_stack = NIL;
++ 	call_graph = NULL;
+  }
+  
+  
+***************
+*** 4481,4483 **** pgstat_recv_funcpurge(PgStat_MsgFuncpurge *msg, int len)
+--- 4581,4616 ----
+  						   HASH_REMOVE, NULL);
+  	}
+  }
++ 
++ /* ----------
++  * pgstat_edge_comparator() -
++  *
++  *	QSort comparator function to compare PgStat_CallGraphEdge structs.
++  * ----------
++  */
++ static int
++ pgstat_edge_comparator(const void *arg1, const void *arg2)
++ {
++ 	PgStat_CallGraphEdge *edge1 = (PgStat_CallGraphEdge *) arg1;
++ 	PgStat_CallGraphEdge *edge2 = (PgStat_CallGraphEdge *) arg2;
++ 
++ 	if (edge1->caller_oid < edge2->caller_oid)
++ 	{
++ 		return 1;
++ 	}
++ 	else if (edge1->caller_oid > edge2->caller_oid)
++ 	{
++ 		return -1;
++ 	}
++ 
++ 	if (edge1->called_oid < edge2->called_oid)
++ 	{
++ 		return 1;
++ 	}
++ 	else if (edge1->called_oid > edge2->called_oid)
++ 	{
++ 		return -1;
++ 	}
++ 
++ 	return 0;
++ }
+*** a/src/include/pgstat.h
+--- b/src/include/pgstat.h
+***************
+*** 655,660 **** typedef struct PgStat_FunctionCallUsage
+--- 655,668 ----
+  	instr_time	f_start;
+  } PgStat_FunctionCallUsage;
+  
++ /*
++  * Call graph edge of caller and called function oids
++  */
++ typedef struct PgStat_CallGraphEdge
++ {
++ 	Oid	caller_oid;
++ 	Oid	called_oid;
++ } PgStat_CallGraphEdge;
+  
+  /* ----------
+   * GUC parameters
